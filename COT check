@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+import sys
+import pandas as pd
+from pathlib import Path
+
+CANDIDATE_FILES = [
+    "COTsignals1-Data.csv",
+    "COTsignals1-Data.xlsx",
+    "COT SIgnale (1).xlsx",
+    "COT Signale (1).xlsx",
+]
+
+OUTPUT_TSV = "COTsignalsoutputs.tsv"
+
+# ---------- Helpers ----------
+def normalize_pair(p: str) -> str:
+    return p.strip().upper().replace("/", "").replace(" ", "")
+
+def smart_parse_series(s: pd.Series) -> pd.Series:
+    """Parse Dates ohne Warning: erst ISO (dayfirst=False), dann EU (dayfirst=True) für Rest."""
+    s1 = pd.to_datetime(s, errors="coerce", dayfirst=False)
+    need = s1.isna()
+    if need.any():
+        s2 = pd.to_datetime(s[need], errors="coerce", dayfirst=True)
+        s1.loc[need] = s2
+    return s1
+
+def find_columns(df: pd.DataFrame):
+    cols = {c.lower().strip(): c for c in df.columns}
+    def pick(*cands):
+        for c in cands:
+            if c in cols:
+                return cols[c]
+        for key, orig in cols.items():
+            if any(c in key for c in cands):
+                return orig
+        return None
+    start_col = pick("start date","start","beginn","von")
+    end_col   = pick("end date","end","ende","bis")
+    dir_col   = pick("direction","signal","type","richtung")
+    pair_col  = pick("pair","symbol","paar","ticker")
+    return start_col, end_col, dir_col, pair_col
+
+def load_cot_data() -> pd.DataFrame:
+    file_path = None
+    for cand in CANDIDATE_FILES:
+        p = Path(cand)
+        if p.exists():
+            file_path = p
+            break
+    if file_path is None:
+        print("Keine COT-Daten gefunden. Erwartet eine der Dateien:", ", ".join(CANDIDATE_FILES), file=sys.stderr)
+        sys.exit(1)
+
+    if file_path.suffix.lower() in (".xlsx", ".xls"):
+        sheets = pd.read_excel(file_path, sheet_name=None)
+        frames = []
+        for sheet_name, df in sheets.items():
+            if df.empty:
+                continue
+            s_col, e_col, d_col, p_col = find_columns(df)
+            tmp = df.copy()
+            if p_col is None:
+                tmp["Pair"] = sheet_name
+                p_col = "Pair"
+            if not (s_col and e_col and d_col and p_col):
+                continue
+            tmp = tmp[[s_col, e_col, d_col, p_col]].rename(columns={
+                s_col:"Start Date", e_col:"End Date", d_col:"Direction", p_col:"Pair"
+            })
+            frames.append(tmp)
+        if not frames:
+            print("Konnte in der Excel keine gültigen Spalten erkennen (Start/End/Direction/Pair).", file=sys.stderr)
+            sys.exit(1)
+        data = pd.concat(frames, ignore_index=True)
+    else:
+        data = pd.read_csv(file_path)
+        s_col, e_col, d_col, p_col = find_columns(data)
+        if not (s_col and e_col and d_col and p_col):
+            print("CSV benötigt Spalten für Start/End/Direction/Pair (oder ähnliche Namen).", file=sys.stderr)
+            sys.exit(1)
+        data = data[[s_col, e_col, d_col, p_col]].rename(columns={
+            s_col:"Start Date", e_col:"End Date", d_col:"Direction", p_col:"Pair"
+        })
+
+    # Normalisierung
+    data["Pair"] = (data["Pair"].astype(str)
+                    .str.upper().str.replace("/", "", regex=False).str.replace(" ", "", regex=False))
+    data["Direction"] = data["Direction"].astype(str).str.strip().str.lower()
+
+    # Datum parsing ohne Warning
+    data["Start Date"] = smart_parse_series(data["Start Date"])
+    data["End Date"]   = smart_parse_series(data["End Date"])
+    data = data.dropna(subset=["Start Date","End Date"])
+    data = data[data["Direction"].isin(["long","short"])]
+
+    # Start <= End erzwingen
+    mask = data["Start Date"] > data["End Date"]
+    if mask.any():
+        data.loc[mask, ["Start Date","End Date"]] = data.loc[mask, ["End Date","Start Date"]].values
+
+    return data
+
+def filter_by_pair_and_range(df: pd.DataFrame, pair: str, user_start: pd.Timestamp, user_end: pd.Timestamp) -> pd.DataFrame:
+    pair_df = df[df["Pair"] == pair].copy()
+    overlap = (pair_df["Start Date"] <= user_end) & (user_start <= pair_df["End Date"])
+    return pair_df.loc[overlap, ["Start Date","End Date","Direction","Pair"]].sort_values(["Start Date","End Date"])
+
+def parse_user_date(s: str) -> pd.Timestamp:
+    # Erst ISO, dann EU
+    out = pd.to_datetime(s, errors="coerce", dayfirst=False)
+    if pd.isna(out):
+        out = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    if pd.isna(out):
+        raise ValueError(f"Ungültiges Datum: {s}")
+    return out
+
+# ---------- Main ----------
+def main():
+    print("=== COT Signals Export → COTsignalsoutputs.tsv ===")
+    pair_in = input("Pair (z.B. EURUSD oder EUR/USD): ").strip()
+    start_in = input("Start-Datum (YYYY-MM-DD oder DD.MM.YYYY): ").strip()
+    end_in   = input("End-Datum   (YYYY-MM-DD oder DD.MM.YYYY): ").strip()
+
+    try:
+        pair = normalize_pair(pair_in)
+        user_start = parse_user_date(start_in)
+        user_end   = parse_user_date(end_in)
+        if user_start > user_end:
+            user_start, user_end = user_end, user_start
+    except Exception as e:
+        print(f"Fehler beim Einlesen: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    df = load_cot_data()
+    out = filter_by_pair_and_range(df, pair, user_start, user_end)
+
+    # Einheitliche Ausgabe
+    if out.empty:
+        print(f"Keine Signale für {pair} im Zeitraum {user_start.date()} bis {user_end.date()} gefunden.")
+        out.to_csv(OUTPUT_TSV, sep="\t", index=False)  # schreibt Header
+        return
+
+    out = out.copy()
+    out["Start Date"] = out["Start Date"].dt.strftime("%Y-%m-%d")
+    out["End Date"]   = out["End Date"].dt.strftime("%Y-%m-%d")
+    out["Direction"]  = out["Direction"].str.lower()
+    out["Pair"]       = out["Pair"].str.upper()
+
+    out.to_csv(OUTPUT_TSV, sep="\t", index=False)
+    print(f"{len(out)} Signale exportiert → {OUTPUT_TSV}")
+
+if __name__ == "__main__":
+    main()
