@@ -1,13 +1,17 @@
-# breakout_detection.py
+#!/usr/bin/env python3
+# chat 5 breakout
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-import re, sys, os, glob
+import re, sys
 import pandas as pd
+
+# ============================ Konfiguration ============================
 
 EXCEL_FILES = ["SMA 1_10.xlsx", "SMA 11_20.xlsx", "SMA 21_28.xlsx"]
 DEFAULT_LOOKBACK = 4
-DEFAULT_OUTFILE = "fibbreakout-fiborigin.csv"
+DEFAULT_OUT_CSV  = "fibbreakout-fiborigin.csv"
+DEFAULT_OUT_XLSX = "fibbreakout-fiborigin.xlsx"
 
 COLUMN_ALIASES: Dict[str, List[str]] = {
     "time":  ["time", "Time", "datetime", "timestamp", "date", "Date"],
@@ -26,6 +30,8 @@ CUT_ALIASES: Dict[str, List[str]] = {
     "end":       ["End Date", "end", "to", "End"],
     "direction": ["Direction", "direction", "signal"],
 }
+
+# ============================ Utils ===================================
 
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
@@ -55,7 +61,11 @@ def _end_exclusive_if_date_like(t: pd.Timestamp) -> pd.Timestamp:
         return t + pd.Timedelta(days=1)
     return t
 
-# ---------------- Excel Loader ----------------
+def _fail(msg: str, code: int = 1):
+    print(f"❌ {msg}", file=sys.stderr)
+    sys.exit(code)
+
+# ============================ Excel Loader ============================
 
 class PriceBook:
     def __init__(self, excel_files: Iterable[str] = EXCEL_FILES):
@@ -70,43 +80,41 @@ class PriceBook:
             for sheet in x.sheet_names:
                 idx[sheet] = f
         if not idx:
-            raise FileNotFoundError("Keine Excel-Dateien gefunden: " + ", ".join(EXCEL_FILES))
+            _fail("Keine Excel-Dateien gefunden: " + ", ".join(EXCEL_FILES))
         return idx
 
-    def load(self, pair: str) -> pd.DataFrame:
+    def load(self, pair: str) -> Tuple[pd.DataFrame, Path, str]:
         key = next((s for s in self.sheet_index if s.lower()==pair.lower()), None)
         if key is None:
-            raise ValueError(f"Unbekanntes Pair/Sheet: {pair}")
-        df = pd.read_excel(self.sheet_index[key], sheet_name=key)
+            _fail(f"Unbekanntes Pair/Sheet: {pair}")
+        fpath = self.sheet_index[key]
+        df = pd.read_excel(fpath, sheet_name=key)
         df = _normalize_columns(df, COLUMN_ALIASES)
 
         required = {"time","open","high","low","close","upper","lower","smma75"}
         missing = [c for c in required if c not in df.columns]
         if missing:
-            raise ValueError(f"[{pair}] Fehlende Spalten {missing}. Erwartet u.a. 'SMMA.1' als smma75.")
+            _fail(f"[{pair}] Fehlende Spalten {missing}. Erwartet u.a. 'SMMA.1' als smma75.")
 
         for col in ["open","high","low","close","upper","lower","smma75"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
         df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
-        return df
+        return df, fpath, key
 
-# ---------------- Detection ----------------
+# ============================ Detection ======================================
 
-def _find_runs(df: pd.DataFrame, start_mask: pd.Series, stay_mask: pd.Series) -> List[Tuple[int,int]]:
-    runs: List[Tuple[int,int]] = []
-    n = len(df)
-    starts = df.index[start_mask.fillna(False)]
-    for si in starts:
-        if si>0 and bool(stay_mask.iloc[si-1]):  # nicht mitten im Run starten
-            continue
-        ei = si
-        j = si
-        while j<n and bool(stay_mask.iloc[j]):
-            ei = j; j += 1
-        if ei >= si:
-            runs.append((si, ei))
-    return runs
+def _runs(mask: pd.Series) -> pd.Series:
+    return (mask.fillna(False) != mask.fillna(False).shift()).cumsum()
+
+def _find_blocks(mask: pd.Series) -> List[Tuple[int,int]]:
+    """Zusammenhängende True-Blöcke als (start_i, end_i)."""
+    out = []
+    groups = _runs(mask)
+    for gid in groups[mask].unique():
+        idx = mask.index[mask & (groups == gid)]
+        out.append((idx[0], idx[-1]))
+    return out
 
 def _extreme(df: pd.DataFrame, si: int, ei: int, lookback: int, kind: str):
     lo = max(0, si - lookback)
@@ -119,38 +127,64 @@ def _extreme(df: pd.DataFrame, si: int, ei: int, lookback: int, kind: str):
         idx = win["low"].idxmin()
         return df.loc[idx,"time"], float(df.loc[idx,"low"])
 
-def _signals_for_mode(df: pd.DataFrame, mode: str, direction: str, windows, lookback: int) -> List[Dict]:
+def _signals_for_mode(
+    df: pd.DataFrame,
+    mode: str,                 # "breakout" | "origin"
+    direction: str,            # "long" | "short"
+    windows, lookback: int,
+    meta_pair: str, meta_file: Path, meta_sheet: str,
+) -> List[Dict]:
     c,u,l,m = df["close"], df["upper"], df["lower"], df["smma75"]
 
+    # 1) Stay-Regel als Band-Block
     if mode=="breakout":
-        if direction=="long":
-            start = (c>u) & (c>m); stay = (c>u); name="Long Breakout"; extreme="high"
-        else:
-            start = (c<l) & (c<m); stay = (c<l); name="Short Breakout"; extreme="low"
+        stay_mask = (c>u) if direction=="long" else (c<l)
+        start_mask = ((c>u) & (c>m)) if direction=="long" else ((c<l) & (c<m))
+        name = "Long Breakout" if direction=="long" else "Short Breakout"
+        extreme_kind = "high" if direction=="long" else "low"      # oberhalb ⇒ High, unterhalb ⇒ Low
     elif mode=="origin":
-        if direction=="long":
-            start = (c<l); stay = (c<l); name="Fib Long Origin"; extreme="high"
-        else:
-            start = (c>u); stay = (c>u); name="Fib Short Origin"; extreme="low"
+        stay_mask = (c<l) if direction=="long" else (c>u)
+        start_mask = stay_mask.copy()                               # SMA egal
+        name = "Fib Long Origin" if direction=="long" else "Fib Short Origin"
+        extreme_kind = "low" if direction=="long" else "high"       # unterhalb ⇒ Low, oberhalb ⇒ High
     else:
         raise ValueError("mode must be 'breakout' or 'origin'")
 
-    runs = _find_runs(df, start, stay)
     out=[]
-    for si,ei in runs:
-        st, et = df.loc[si,"time"], df.loc[ei,"time"]
+    for blk_start, blk_end in _find_blocks(stay_mask):
+        # 2) Start innerhalb des Blocks ermitteln
+        if mode=="breakout":
+            cand = start_mask.loc[blk_start:blk_end]
+            if not cand.any():
+                continue
+            start_i = int(cand[cand].index[0])
+        else:
+            start_i = int(blk_start)
+        end_i = int(blk_end)
+
+        st, et = df.loc[start_i,"time"], df.loc[end_i,"time"]
+
+        # 3) CUT-Fenster: Start muss innerhalb liegen
         if windows and not any((st>=ws) and (st<we) for (ws,we) in windows):
             continue
-        xt_t, xt_p = _extreme(df, si, ei, lookback, extreme)
+
+        # 4) Extremwert im ±lookback Fenster um [start..end]
+        xt_t, xt_p = _extreme(df, start_i, end_i, lookback, extreme_kind)
+
         out.append({
+            "pair": meta_pair,
             "signal_type": name,
             "direction": "Long" if direction=="long" else "Short",
+            "window_start": windows[0][0],
+            "window_end":   windows[0][1],
             "start_time": st, "end_time": et,
             "extreme_time": xt_t, "extreme_price": xt_p,
+            "source_file": meta_file.name,
+            "source_sheet": meta_sheet,
         })
     return out
 
-# ---------------- CUT Loader ----------------
+# ============================ CUT Loader =====================================
 
 def _diagnostic_file_error(target: Path) -> str:
     here = Path.cwd()
@@ -161,24 +195,25 @@ def _diagnostic_file_error(target: Path) -> str:
             f"Tipp: --cut auf korrekten Pfad setzen oder Datei umbenennen.")
 
 def _read_table_any(path: Path) -> pd.DataFrame:
+    # 1) Auto-Delimiter (Tab/Komma/Semikolon)
     try:
         df = pd.read_csv(path, sep=None, engine="python", comment="#")
     except pd.errors.EmptyDataError:
-        raise FileNotFoundError(_diagnostic_file_error(path))
+        _fail(_diagnostic_file_error(path))
     except Exception:
         df = pd.DataFrame()
-
+    # 2) Tab erzwingen
     if df.empty or len(df.columns) == 1:
         try:
             df = pd.read_csv(path, sep="\t", engine="python", comment="#")
         except Exception:
             df = pd.DataFrame()
-
+    # 3) Beliebig viele Leerzeichen als Trenner
     if df.empty or len(df.columns) == 1:
         try:
             df = pd.read_csv(path, delim_whitespace=True, engine="python", comment="#")
         except Exception:
-            raise FileNotFoundError(_diagnostic_file_error(path))
+            _fail(_diagnostic_file_error(path))
     return df
 
 def _find_cut_path(cli_path: Optional[str]) -> Path:
@@ -201,15 +236,15 @@ def _find_cut_path(cli_path: Optional[str]) -> Path:
 def load_cut(cli_path: Optional[str]) -> pd.DataFrame:
     p = _find_cut_path(cli_path)
     if not p.exists():
-        raise FileNotFoundError(_diagnostic_file_error(p))
+        _fail(_diagnostic_file_error(p))
     df = _read_table_any(p)
     df = _normalize_columns(df, CUT_ALIASES)
 
     req = {"pair","start","end","direction"}
     miss = [c for c in req if c not in df.columns]
     if miss:
-        raise ValueError("CUT: fehlende Spalten "
-                         f"{miss}. Erwartet Header wie: Start Date   End Date   Direction   Pair")
+        _fail("CUT: fehlende Spalten "
+              f"{miss}. Erwartet Header wie: Start Date   End Date   Direction   Pair")
 
     df["start"] = df["start"].apply(_ensure_utc)
     df["end"]   = df["end"].apply(_ensure_utc).apply(_end_exclusive_if_date_like)
@@ -220,18 +255,53 @@ def load_cut(cli_path: Optional[str]) -> pd.DataFrame:
     )
     if df["direction"].isna().any():
         bad = df[df["direction"].isna()]
-        raise ValueError(f"CUT: unklare Direction in Zeilen: {bad.index.tolist()}")
+        _fail(f"CUT: unklare Direction in Zeilen: {bad.index.tolist()}")
     df["pair"] = df["pair"].astype(str)
     return df
 
-# ---------------- Main ----------------
+# ============================ Output (DEIN MODUL) ============================
+
+def _save_outputs(df: pd.DataFrame, csv_path: str, xlsx_path: str) -> None:
+    # CSV
+    df.to_csv(csv_path, index=False)
+
+    # XLSX mit formatiertem Tabellenblatt (+ Tabs Breakouts/Origins)
+    try:
+        from pandas import ExcelWriter
+        from openpyxl.worksheet.table import Table, TableStyleInfo
+        from openpyxl.utils import get_column_letter
+
+        with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Signals")
+            ws = writer.sheets["Signals"]
+            max_row = ws.max_row
+            max_col = ws.max_column
+            ref = f"A1:{get_column_letter(max_col)}{max_row}"
+            table = Table(displayName="SignalsTable", ref=ref)
+            table.tableStyleInfo = TableStyleInfo(
+                name="TableStyleMedium9", showRowStripes=True, showColumnStripes=False
+            )
+            ws.add_table(table)
+
+            if not df.empty:
+                df_break = df[df["signal_type"].str.contains("Breakout")].copy()
+                df_orig  = df[df["signal_type"].str.contains("Origin")].copy()
+                if not df_break.empty:
+                    df_break.to_excel(writer, index=False, sheet_name="Breakouts")
+                if not df_orig.empty:
+                    df_orig.to_excel(writer, index=False, sheet_name="Origins")
+    except Exception as e:
+        print(f"⚠️ XLSX-Ausgabe nicht möglich ({e}). CSV wurde erstellt.")
+
+# ============================ Main ====================================
 
 def main():
     import argparse
     p = argparse.ArgumentParser(description="Fib Breakout & Origin Finder (KC + SMMA.1, CUT TSV/CSV)")
     p.add_argument("--cut", default=None, help="Pfad zu COT/CUT (TSV/CSV). Wenn leer, wird automatisch gesucht.")
     p.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK, help="± Kerzen um Start/Ende")
-    p.add_argument("--out", default=DEFAULT_OUTFILE, help="Output CSV (Default: fibbreakout-fiborigin.csv)")
+    p.add_argument("--out",  default=DEFAULT_OUT_CSV,  help="Output CSV (Default: fibbreakout-fiborigin.csv)")
+    p.add_argument("--xlsx", default=DEFAULT_OUT_XLSX, help="Output XLSX (Default: fibbreakout-fiborigin.xlsx)")
     args = p.parse_args()
 
     book = PriceBook()
@@ -240,29 +310,28 @@ def main():
     rows=[]
     for _, r in cut.iterrows():
         pair = str(r["pair"]); ws, we = r["start"], r["end"]; want = r["direction"]
-        df = book.load(pair)
+        df, fpath, sheet = book.load(pair)
         windows=[(ws,we)]
         for mode in ("breakout","origin"):
-            recs = _signals_for_mode(df, mode, want, windows, args.lookback)
-            for rec in recs:
-                rows.append({
-                    "pair": pair,
-                    "window_start": ws,
-                    "window_end": we,
-                    **rec
-                })
+            rows += _signals_for_mode(
+                df, mode, want, windows, args.lookback,
+                meta_pair=pair, meta_file=fpath, meta_sheet=sheet
+            )
 
-    out_cols = ["pair","signal_type","direction","window_start","window_end",
-                "start_time","end_time","extreme_time","extreme_price"]
-    out = pd.DataFrame(rows)[out_cols].sort_values(
-        ["pair","signal_type","start_time"]
-    ).reset_index(drop=True)
+    # nur die Spalten, die du in deinem Output willst
+    out_cols = [
+        "pair","signal_type","direction","window_start","window_end",
+        "start_time","end_time","extreme_time","extreme_price"
+    ]
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out[out_cols].sort_values(["pair","signal_type","start_time"]).reset_index(drop=True)
 
-    out.to_csv(args.out, index=False)
-    print(f"✅ done. Wrote: {args.out}")
+    _save_outputs(out, args.out, args.xlsx)
+
+    print(f"✅ done. Wrote: {args.out}  &  {args.xlsx}")
     if not out.empty:
         print(out.head(min(12, len(out))).to_string(index=False))
 
 if __name__ == "__main__":
     main()
-
