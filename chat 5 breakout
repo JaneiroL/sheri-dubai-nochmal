@@ -1,0 +1,318 @@
+# breakout_detection.py
+from __future__ import annotations
+import re
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import pandas as pd
+
+# ============================ Konfiguration ==================================
+
+# Excel-Dateien (Sheets = Paare). Passe Pfade an, falls nötig.
+EXCEL_FILES = ["SMA 1_10.xlsx", "SMA 11_20.xlsx", "SMA 21_28.xlsx"]
+
+# Flexible Spaltenzuordnung (Excel)
+COLUMN_ALIASES: Dict[str, List[str]] = {
+    "time":  ["time", "timestamp", "datetime", "date", "Date", "Time"],
+    "open":  ["open", "Open"],
+    "high":  ["high", "High"],
+    "low":   ["low", "Low"],
+    "close": ["close", "Close", "c"],
+    # Keltner / Bänder
+    "upper": ["Upper", "upper", "BB_Upper", "UpperBand", "upper_band", "keltner_upper", "keltner_upper_band"],
+    "lower": ["Lower", "lower", "BB_Lower", "LowerBand", "lower_band", "keltner_lower", "keltner_lower_band"],
+    # MA / SMMA Filter (optional; wenn fehlt, wird neutralisiert)
+    "smma1": ["SMMA.1", "SMMA_1", "SMMA1", "EMA", "MA", "SMA", "SMA75", "SMMA75"],
+}
+
+# Flexible Spaltenzuordnung (COT CSV) – tolerant gegenüber Leerzeichen/Unterstrichen
+COT_ALIASES: Dict[str, List[str]] = {
+    "pair":      ["pair", "symbol", "sheet", "Pair", "Symbol", "Sheet"],
+    "start":     ["start", "startdate", "from", "fromdate", "start_date", "start date", "Start", "StartDate", "Start_Date", "Start Date"],
+    "end":       ["end", "enddate", "to", "todate", "end_date", "end date", "until", "End", "EndDate", "End_Date", "End Date"],
+    "direction": ["direction", "dir", "signal", "Direction", "Signal"],
+}
+
+DEFAULT_LOOKBACK = 4  # ± Zeilen um Start/Ende für die Extrem-Suche
+
+
+# ============================ Utility / Normalisierung ========================
+
+def _norm(s: str) -> str:
+    """Kanonisiert Spaltennamen (lowercase, nur a-z0-9)."""
+    return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
+
+def _build_alias_map(aliases: Dict[str, List[str]]) -> Dict[str, str]:
+    m = {}
+    for canon, alist in aliases.items():
+        for a in alist:
+            m[_norm(a)] = canon
+    return m
+
+def _normalize_columns(df: pd.DataFrame, aliases: Dict[str, List[str]]) -> pd.DataFrame:
+    amap = _build_alias_map(aliases)
+    new_cols = {}
+    for col in df.columns:
+        canon = amap.get(_norm(col))
+        new_cols[col] = canon if canon else col
+    return df.rename(columns=new_cols)
+
+def _runs(mask: pd.Series) -> pd.Series:
+    """Gruppen-IDs für konsekutive True/False-Runs."""
+    return (mask.fillna(False) != mask.fillna(False).shift()).cumsum()
+
+def _ensure_utc(ts) -> pd.Timestamp:
+    """Macht jeden Zeitwert robust UTC-aware (verträgt naive + bereits tz-aware)."""
+    t = pd.to_datetime(ts, errors="coerce")
+    if t is None or pd.isna(t):
+        return t
+    # pandas Timestamp hat .tzinfo via .tz
+    if getattr(t, "tz", None) is None:
+        return t.tz_localize("UTC")
+    return t.tz_convert("UTC")
+
+
+# ============================ Excel Loader ===================================
+
+class BreakoutDetector:
+    def __init__(self, excel_files: Iterable[str] = EXCEL_FILES):
+        self.excel_files = [Path(f) for f in excel_files]
+        self.pair_to_file = self._index_workbooks()
+
+    def _index_workbooks(self) -> Dict[str, Path]:
+        pair_to_file: Dict[str, Path] = {}
+        for file in self.excel_files:
+            if not file.exists():
+                continue
+            xls = pd.ExcelFile(file)
+            for sheet in xls.sheet_names:
+                pair_to_file[sheet] = file
+        if not pair_to_file:
+            raise FileNotFoundError(
+                "Keine der konfigurierten Excel-Dateien gefunden "
+                f"(gesucht: {', '.join(EXCEL_FILES)})."
+            )
+        return pair_to_file
+
+    def load_pair(self, pair: str, sheet: Optional[str] = None) -> pd.DataFrame:
+        """Lädt ein Paar (Sheet) und normalisiert die Spalten."""
+        key = sheet or pair
+        fpath = self.pair_to_file.get(key)
+        if not fpath:
+            # Case-insensitive Fallback
+            for s, p in self.pair_to_file.items():
+                if s.lower() == key.lower():
+                    fpath, key = p, s
+                    break
+        if not fpath:
+            raise ValueError(f"Unbekanntes Pair/Sheet: {pair}")
+
+        df = pd.read_excel(fpath, sheet_name=key)
+        df = _normalize_columns(df, COLUMN_ALIASES)
+
+        required = {"time", "high", "low", "close", "upper", "lower"}
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"[{pair}] Fehlende Spalten {missing}. Vorhanden: {list(df.columns)}")
+
+        if "smma1" not in df.columns:
+            # Neutraler Filter, falls kein SMMA/MA vorhanden
+            df["smma1"] = df["close"].astype(float)
+
+        # Zeitsäule -> UTC, sortieren
+        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+        df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+        return df
+
+
+# ============================ Signal-Detection ================================
+
+def find_breakouts_or_origins(
+    df: pd.DataFrame,
+    lookback: int = DEFAULT_LOOKBACK,
+    windows: Optional[List[Tuple[pd.Timestamp, pd.Timestamp]]] = None,
+    want_direction: Optional[str] = None,  # "long" | "short" | None
+    mode: str = "breakout",  # "breakout" | "origin"
+) -> List[Dict]:
+    """
+    mode = 'breakout':
+        Long  = close > upper  AND close > smma1
+        Short = close < lower  AND close < smma1
+        Extrem: Long -> High, Short -> Low (im erweiterten Fenster: ±lookback)
+
+    mode = 'origin' (Fib Origins – umgekehrt, ohne SMMA-Filter):
+        Fib Long Origin  = close < lower
+        Fib Short Origin = close > upper
+        Extrem: Long Origin -> Low, Short Origin -> High
+    """
+    c = df["close"].astype(float)
+    u = df["upper"].astype(float)
+    l = df["lower"].astype(float)
+    m = df["smma1"].astype(float)
+
+    if mode == "breakout":
+        cond_long = (c > u) & (c > m)
+        cond_short = (c < l) & (c < m)
+        name_long = "Long Breakout"
+        name_short = "Short Breakout"
+        extreme_for = {"long": "high", "short": "low"}
+    elif mode == "origin":
+        cond_long = (c < l)   # unter Keltner unten
+        cond_short = (c > u)  # über Keltner oben
+        name_long = "Fib Long Origin"
+        name_short = "Fib Short Origin"
+        extreme_for = {"long": "low", "short": "high"}
+    else:
+        raise ValueError("mode must be 'breakout' or 'origin'")
+
+    results: List[Dict] = []
+    for direction, mask in (("long", cond_long), ("short", cond_short)):
+        if want_direction and direction.lower() != want_direction.lower():
+            continue
+
+        groups = _runs(mask)
+        for gid in groups[mask].unique():
+            idx = df.index[mask & (groups == gid)]
+            start_i, end_i = idx[0], idx[-1]
+
+            # Extrem-Suche im erweiterten Fenster: 4 vor Start & 4 nach Ende (Standard)
+            lo = max(0, start_i - lookback)
+            hi = min(len(df) - 1, end_i + lookback)
+            window_df = df.loc[lo:hi]
+
+            if extreme_for[direction] == "high":
+                extreme_idx = window_df["high"].idxmax()
+                extreme_price = float(df.loc[extreme_idx, "high"])
+            else:
+                extreme_idx = window_df["low"].idxmin()
+                extreme_price = float(df.loc[extreme_idx, "low"])
+
+            start_time = df.loc[start_i, "time"]
+            end_time = df.loc[end_i, "time"]
+            extreme_time = df.loc[extreme_idx, "time"]
+
+            # Fenster-Filter: nur behalten, wenn irgendein Fenster überlappt
+            if windows:
+                overlaps = any((end_time >= ws) and (start_time < we) for (ws, we) in windows)
+                if not overlaps:
+                    continue
+
+            results.append(
+                {
+                    "signal_type": name_long if direction == "long" else name_short,
+                    "direction": "Long" if direction == "long" else "Short",
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "extreme_time": extreme_time,
+                    "extreme_price": extreme_price,
+                }
+            )
+
+    results.sort(key=lambda x: x["start_time"])
+    return results
+
+
+# ============================ COT CSV Loader =================================
+
+def load_cot_signals(csv_path: str | Path) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    df = _normalize_columns(df, COT_ALIASES)
+    # Nach deinem Beispiel: Header = Start Date, End Date, Direction, Pair
+    # -> werden zu start, end, direction, pair
+
+    required = {"pair", "start", "end", "direction"}
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"COT CSV: fehlende Spalten {missing}. Vorhanden: {list(df.columns)}")
+
+    # Zeiten -> robust UTC
+    df["start"] = df["start"].apply(_ensure_utc)
+    df["end"] = df["end"].apply(_ensure_utc)
+    df = df.dropna(subset=["start", "end"]).reset_index(drop=True)
+
+    # Direction normalisieren
+    df["direction"] = (
+        df["direction"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .map({"long": "long", "short": "short", "buy": "long", "sell": "short"})
+    )
+    if df["direction"].isna().any():
+        bad = df[df["direction"].isna()]
+        raise ValueError(f"COT CSV: unklare Direction in Zeilen: {bad.index.tolist()}")
+
+    # Pair als String
+    df["pair"] = df["pair"].astype(str)
+    return df
+
+
+# ============================ Main / CLI =====================================
+
+def main():
+    import argparse
+
+    p = argparse.ArgumentParser(description="Breakout & Fib Origin Detector (Excel + COT CSV)")
+    p.add_argument("--cot", default="cot_signals_output.csv", help="Pfad zur COT-Signalliste (CSV)")
+    p.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK, help="± Zeilen um Start/Ende für Extrem-Suche")
+    p.add_argument("--out", default="breakouts_results.csv", help="Output-CSV")
+    args = p.parse_args()
+
+    det = BreakoutDetector()
+    cot = load_cot_signals(args.cot)
+
+    all_rows = []
+    for ridx, row in cot.iterrows():
+        pair = str(row["pair"])
+        win = (_ensure_utc(row["start"]), _ensure_utc(row["end"]))  # <-- tz-robust
+        want_dir = row["direction"]  # "long"|"short"
+
+        df = det.load_pair(pair)
+
+        # (1) Klassische Breakouts (mit SMMA-Filter)
+        brks = find_breakouts_or_origins(
+            df,
+            lookback=args.lookback,
+            windows=[win],
+            want_direction=want_dir,
+            mode="breakout",
+        )
+
+        # (2) Fib Origins (umgekehrt, ohne SMMA-Filter)
+        origins = find_breakouts_or_origins(
+            df,
+            lookback=args.lookback,
+            windows=[win],
+            want_direction=want_dir,
+            mode="origin",
+        )
+
+        # Sammeln
+        for rec in brks + origins:
+            all_rows.append(
+                {
+                    "cot_row": ridx,
+                    "pair": pair,
+                    "window_start": win[0],
+                    "window_end": win[1],
+                    **rec,  # signal_type, direction, start_time, end_time, extreme_time, extreme_price
+                }
+            )
+
+        print(
+            f"[{pair} | {want_dir.upper()} | {win[0]} → {win[1]}]  "
+            f"Breakouts: {len(brks)} | Fib Origins: {len(origins)}"
+        )
+
+    out_df = pd.DataFrame(all_rows).sort_values(
+        ["pair", "window_start", "start_time", "signal_type"]
+    ).reset_index(drop=True)
+
+    out_df.to_csv(args.out, index=False)
+    print(f"\n✅ Fertig. Ergebnisse gespeichert: {args.out}")
+    if not out_df.empty:
+        print(out_df.head(min(10, len(out_df))).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
