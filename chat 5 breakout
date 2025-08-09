@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-# chat 5 breakout
+# breakout_detection.py – automatische CUT-Suche
+
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-import re, sys
+import re
 import pandas as pd
 
 # ============================ Konfiguration ============================
@@ -11,7 +12,6 @@ import pandas as pd
 EXCEL_FILES = ["SMA 1_10.xlsx", "SMA 11_20.xlsx", "SMA 21_28.xlsx"]
 DEFAULT_LOOKBACK = 4
 DEFAULT_OUT_CSV  = "fibbreakout-fiborigin.csv"
-DEFAULT_OUT_XLSX = "fibbreakout-fiborigin.xlsx"
 
 COLUMN_ALIASES: Dict[str, List[str]] = {
     "time":  ["time", "Time", "datetime", "timestamp", "date", "Date"],
@@ -21,7 +21,7 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "close": ["close", "Close", "c"],
     "upper": ["Upper", "upper", "keltner_upper", "BB_Upper", "UpperBand"],
     "lower": ["Lower", "lower", "keltner_lower", "BB_Lower", "LowerBand"],
-    "smma75": ["SMMA.1"],  # 75er MUSS exakt so heißen
+    "smma75": ["SMMA.1"],  # 75er SMA MUSS vorhanden sein
 }
 
 CUT_ALIASES: Dict[str, List[str]] = {
@@ -31,7 +31,7 @@ CUT_ALIASES: Dict[str, List[str]] = {
     "direction": ["Direction", "direction", "signal"],
 }
 
-# ============================ Utils ===================================
+# ============================ Hilfsfunktionen ============================
 
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
@@ -45,70 +45,68 @@ def _build_alias_map(aliases: Dict[str, List[str]]) -> Dict[str, str]:
 
 def _normalize_columns(df: pd.DataFrame, aliases: Dict[str, List[str]]) -> pd.DataFrame:
     amap = _build_alias_map(aliases)
-    # Header reinigen (Mehrfachspaces → 1 Space)
     df.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in df.columns]
-    return df.rename(columns={c: (amap.get(_norm(c), c)) for c in df.columns})
+    return df.rename(columns={c: amap.get(_norm(c), c) for c in df.columns})
 
 def _ensure_utc(ts) -> pd.Timestamp:
     t = pd.to_datetime(ts, errors="coerce")
-    if t is None or pd.isna(t): return t
-    if getattr(t, "tz", None) is None: return t.tz_localize("UTC")
+    if pd.isna(t):
+        return t
+    if getattr(t, "tz", None) is None:
+        return t.tz_localize("UTC")
     return t.tz_convert("UTC")
 
 def _end_exclusive_if_date_like(t: pd.Timestamp) -> pd.Timestamp:
-    if pd.isna(t): return t
+    if pd.isna(t):
+        return t
     if t.hour == 0 and t.minute == 0 and t.second == 0 and t.nanosecond == 0:
         return t + pd.Timedelta(days=1)
     return t
 
-def _fail(msg: str, code: int = 1):
-    print(f"❌ {msg}", file=sys.stderr)
-    sys.exit(code)
-
-# ============================ Excel Loader ============================
+# ============================ Daten laden ============================
 
 class PriceBook:
     def __init__(self, excel_files: Iterable[str] = EXCEL_FILES):
-        self.files = [Path(p) for p in excel_files]
+        self.files = [Path(f) for f in excel_files]
         self.sheet_index = self._index()
 
     def _index(self) -> Dict[str, Path]:
-        idx: Dict[str, Path] = {}
+        idx = {}
         for f in self.files:
-            if not f.exists(): continue
-            x = pd.ExcelFile(f)
-            for sheet in x.sheet_names:
+            if not f.exists():
+                continue
+            xls = pd.ExcelFile(f)
+            for sheet in xls.sheet_names:
                 idx[sheet] = f
         if not idx:
-            _fail("Keine Excel-Dateien gefunden: " + ", ".join(EXCEL_FILES))
+            raise FileNotFoundError("Keine Excel-Dateien gefunden.")
         return idx
 
-    def load(self, pair: str) -> Tuple[pd.DataFrame, Path, str]:
-        key = next((s for s in self.sheet_index if s.lower()==pair.lower()), None)
+    def load(self, pair: str) -> pd.DataFrame:
+        key = next((s for s in self.sheet_index if s.lower() == pair.lower()), None)
         if key is None:
-            _fail(f"Unbekanntes Pair/Sheet: {pair}")
+            raise ValueError(f"Unbekanntes Paar: {pair}")
         fpath = self.sheet_index[key]
         df = pd.read_excel(fpath, sheet_name=key)
         df = _normalize_columns(df, COLUMN_ALIASES)
 
-        required = {"time","open","high","low","close","upper","lower","smma75"}
+        required = {"time", "high", "low", "close", "upper", "lower", "smma75"}
         missing = [c for c in required if c not in df.columns]
         if missing:
-            _fail(f"[{pair}] Fehlende Spalten {missing}. Erwartet u.a. 'SMMA.1' als smma75.")
+            raise ValueError(f"[{pair}] Fehlende Spalten {missing}. SMMA.1 muss vorhanden sein.")
 
-        for col in ["open","high","low","close","upper","lower","smma75"]:
+        for col in ["high", "low", "close", "upper", "lower", "smma75"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
+        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
         df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
-        return df, fpath, key
+        return df
 
-# ============================ Detection ======================================
+# ============================ Detection-Logik ============================
 
 def _runs(mask: pd.Series) -> pd.Series:
     return (mask.fillna(False) != mask.fillna(False).shift()).cumsum()
 
-def _find_blocks(mask: pd.Series) -> List[Tuple[int,int]]:
-    """Zusammenhängende True-Blöcke als (start_i, end_i)."""
+def _find_blocks(mask: pd.Series):
     out = []
     groups = _runs(mask)
     for gid in groups[mask].unique():
@@ -118,220 +116,127 @@ def _find_blocks(mask: pd.Series) -> List[Tuple[int,int]]:
 
 def _extreme(df: pd.DataFrame, si: int, ei: int, lookback: int, kind: str):
     lo = max(0, si - lookback)
-    hi = min(len(df)-1, ei + lookback)
+    hi = min(len(df) - 1, ei + lookback)
     win = df.loc[lo:hi]
-    if kind=="high":
+    if kind == "high":
         idx = win["high"].idxmax()
-        return df.loc[idx,"time"], float(df.loc[idx,"high"])
+        return df.loc[idx, "time"], float(df.loc[idx, "high"])
     else:
         idx = win["low"].idxmin()
-        return df.loc[idx,"time"], float(df.loc[idx,"low"])
+        return df.loc[idx, "time"], float(df.loc[idx, "low"])
 
-def _signals_for_mode(
-    df: pd.DataFrame,
-    mode: str,                 # "breakout" | "origin"
-    direction: str,            # "long" | "short"
-    windows, lookback: int,
-    meta_pair: str, meta_file: Path, meta_sheet: str,
-) -> List[Dict]:
-    c,u,l,m = df["close"], df["upper"], df["lower"], df["smma75"]
+def _signals_for_mode(df: pd.DataFrame, mode: str, direction: str, windows, lookback: int):
+    c, u, l, m = df["close"], df["upper"], df["lower"], df["smma75"]
 
-    # 1) Stay-Regel als Band-Block
-    if mode=="breakout":
-        stay_mask = (c>u) if direction=="long" else (c<l)
-        start_mask = ((c>u) & (c>m)) if direction=="long" else ((c<l) & (c<m))
-        name = "Long Breakout" if direction=="long" else "Short Breakout"
-        extreme_kind = "high" if direction=="long" else "low"      # oberhalb ⇒ High, unterhalb ⇒ Low
-    elif mode=="origin":
-        stay_mask = (c<l) if direction=="long" else (c>u)
-        start_mask = stay_mask.copy()                               # SMA egal
-        name = "Fib Long Origin" if direction=="long" else "Fib Short Origin"
-        extreme_kind = "low" if direction=="long" else "high"       # unterhalb ⇒ Low, oberhalb ⇒ High
+    if mode == "breakout":
+        stay_mask = (c > u) if direction == "long" else (c < l)
+        start_mask = ((c > u) & (c > m)) if direction == "long" else ((c < l) & (c < m))
+        name = "Long Breakout" if direction == "long" else "Short Breakout"
+        extreme_kind = "high" if direction == "long" else "low"
+    elif mode == "origin":
+        stay_mask = (c < l) if direction == "long" else (c > u)
+        start_mask = stay_mask.copy()
+        name = "Fib Long Origin" if direction == "long" else "Fib Short Origin"
+        extreme_kind = "low" if direction == "long" else "high"
     else:
-        raise ValueError("mode must be 'breakout' or 'origin'")
+        raise ValueError("Mode muss 'breakout' oder 'origin' sein.")
 
-    out=[]
+    out = []
     for blk_start, blk_end in _find_blocks(stay_mask):
-        # 2) Start innerhalb des Blocks ermitteln
-        if mode=="breakout":
+        if mode == "breakout":
             cand = start_mask.loc[blk_start:blk_end]
             if not cand.any():
                 continue
             start_i = int(cand[cand].index[0])
         else:
             start_i = int(blk_start)
+
         end_i = int(blk_end)
+        st, et = df.loc[start_i, "time"], df.loc[end_i, "time"]
 
-        st, et = df.loc[start_i,"time"], df.loc[end_i,"time"]
-
-        # 3) CUT-Fenster: Start muss innerhalb liegen
-        if windows and not any((st>=ws) and (st<we) for (ws,we) in windows):
+        if windows and not any((st >= ws) and (st < we) for (ws, we) in windows):
             continue
 
-        # 4) Extremwert im ±lookback Fenster um [start..end]
         xt_t, xt_p = _extreme(df, start_i, end_i, lookback, extreme_kind)
 
         out.append({
-            "pair": meta_pair,
             "signal_type": name,
-            "direction": "Long" if direction=="long" else "Short",
-            "window_start": windows[0][0],
-            "window_end":   windows[0][1],
-            "start_time": st, "end_time": et,
-            "extreme_time": xt_t, "extreme_price": xt_p,
-            "source_file": meta_file.name,
-            "source_sheet": meta_sheet,
+            "direction": "Long" if direction == "long" else "Short",
+            "start_time": st,
+            "end_time": et,
+            "extreme_time": xt_t,
+            "extreme_price": xt_p,
         })
     return out
 
-# ============================ CUT Loader =====================================
-
-def _diagnostic_file_error(target: Path) -> str:
-    here = Path.cwd()
-    files = "\n".join(sorted(p.name for p in here.iterdir() if p.is_file()))
-    return (f"CUT-Datei nicht gefunden/leer: {target}\n"
-            f"Arbeitsverzeichnis: {here}\n"
-            f"Vorhandene Dateien:\n{files}\n"
-            f"Tipp: --cut auf korrekten Pfad setzen oder Datei umbenennen.")
-
-def _read_table_any(path: Path) -> pd.DataFrame:
-    # 1) Auto-Delimiter (Tab/Komma/Semikolon)
-    try:
-        df = pd.read_csv(path, sep=None, engine="python", comment="#")
-    except pd.errors.EmptyDataError:
-        _fail(_diagnostic_file_error(path))
-    except Exception:
-        df = pd.DataFrame()
-    # 2) Tab erzwingen
-    if df.empty or len(df.columns) == 1:
-        try:
-            df = pd.read_csv(path, sep="\t", engine="python", comment="#")
-        except Exception:
-            df = pd.DataFrame()
-    # 3) Beliebig viele Leerzeichen als Trenner
-    if df.empty or len(df.columns) == 1:
-        try:
-            df = pd.read_csv(path, delim_whitespace=True, engine="python", comment="#")
-        except Exception:
-            _fail(_diagnostic_file_error(path))
-    return df
+# ============================ CUT Loader ============================
 
 def _find_cut_path(cli_path: Optional[str]) -> Path:
     if cli_path:
         p = Path(cli_path)
-        if p.exists(): return p
-    patterns = [
-        "COTsignalsoutput.tsv",  "COTsignalsoutput.csv",
+        if p.exists():
+            return p
+    search_names = [
+        "COTsignalsoutput.tsv", "COTsignalsoutput.csv",
         "COTsignalsoutputs.tsv", "COTsignalsoutputs.csv",
-        "CUTsignalsoutput.tsv",  "CUTsignalsoutput.csv",
-        "CutSignalsOutput.tsv",  "CutSignalsOutputs.tsv",
-        "*signalsoutput*.tsv",   "*signalsoutput*.csv",
-        "*signalsoutputs*.tsv",  "*signalsoutputs*.csv",
+        "CUTsignalsoutput.tsv", "CUTsignalsoutput.csv",
+        "CutSignalsOutput.tsv", "CutSignalsOutputs.tsv",
     ]
-    for pat in patterns:
-        hits = sorted(Path(".").glob(pat))
-        if hits: return hits[0]
-    return Path("COTsignalsoutput.tsv")
+    for name in search_names:
+        p = Path(name)
+        if p.exists():
+            return p
+    raise FileNotFoundError("Keine CUT-Datei gefunden.")
 
-def load_cut(cli_path: Optional[str]) -> pd.DataFrame:
-    p = _find_cut_path(cli_path)
-    if not p.exists():
-        _fail(_diagnostic_file_error(p))
-    df = _read_table_any(p)
+def load_cut(path: Optional[str]) -> pd.DataFrame:
+    p = _find_cut_path(path)
+    df = pd.read_csv(p, sep=None, engine="python")
     df = _normalize_columns(df, CUT_ALIASES)
-
-    req = {"pair","start","end","direction"}
-    miss = [c for c in req if c not in df.columns]
-    if miss:
-        _fail("CUT: fehlende Spalten "
-              f"{miss}. Erwartet Header wie: Start Date   End Date   Direction   Pair")
-
+    required = {"pair", "start", "end", "direction"}
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"CUT-Datei fehlt Spalten {missing}")
     df["start"] = df["start"].apply(_ensure_utc)
-    df["end"]   = df["end"].apply(_ensure_utc).apply(_end_exclusive_if_date_like)
-    df = df.dropna(subset=["start","end"]).reset_index(drop=True)
+    df["end"] = df["end"].apply(_ensure_utc).apply(_end_exclusive_if_date_like)
     df["direction"] = (
         df["direction"].astype(str).str.strip().str.lower()
-        .map({"long":"long","short":"short","buy":"long","sell":"short"})
+        .map({"long": "long", "short": "short", "buy": "long", "sell": "short"})
     )
-    if df["direction"].isna().any():
-        bad = df[df["direction"].isna()]
-        _fail(f"CUT: unklare Direction in Zeilen: {bad.index.tolist()}")
     df["pair"] = df["pair"].astype(str)
     return df
 
-# ============================ Output (DEIN MODUL) ============================
+# ============================ Output ============================
 
-def _save_outputs(df: pd.DataFrame, csv_path: str, xlsx_path: str) -> None:
-    # CSV
-    df.to_csv(csv_path, index=False)
-
-    # XLSX mit formatiertem Tabellenblatt (+ Tabs Breakouts/Origins)
-    try:
-        from pandas import ExcelWriter
-        from openpyxl.worksheet.table import Table, TableStyleInfo
-        from openpyxl.utils import get_column_letter
-
-        with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Signals")
-            ws = writer.sheets["Signals"]
-            max_row = ws.max_row
-            max_col = ws.max_column
-            ref = f"A1:{get_column_letter(max_col)}{max_row}"
-            table = Table(displayName="SignalsTable", ref=ref)
-            table.tableStyleInfo = TableStyleInfo(
-                name="TableStyleMedium9", showRowStripes=True, showColumnStripes=False
-            )
-            ws.add_table(table)
-
-            if not df.empty:
-                df_break = df[df["signal_type"].str.contains("Breakout")].copy()
-                df_orig  = df[df["signal_type"].str.contains("Origin")].copy()
-                if not df_break.empty:
-                    df_break.to_excel(writer, index=False, sheet_name="Breakouts")
-                if not df_orig.empty:
-                    df_orig.to_excel(writer, index=False, sheet_name="Origins")
-    except Exception as e:
-        print(f"⚠️ XLSX-Ausgabe nicht möglich ({e}). CSV wurde erstellt.")
+def _save_outputs(df: pd.DataFrame, csv_path: str):
+    df.to_csv(csv_path, index=False, sep=";")
+    print(f"✅ Output gespeichert: {csv_path}")
 
 # ============================ Main ====================================
 
 def main():
     import argparse
-    p = argparse.ArgumentParser(description="Fib Breakout & Origin Finder (KC + SMMA.1, CUT TSV/CSV)")
-    p.add_argument("--cut", default=None, help="Pfad zu COT/CUT (TSV/CSV). Wenn leer, wird automatisch gesucht.")
-    p.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK, help="± Kerzen um Start/Ende")
-    p.add_argument("--out",  default=DEFAULT_OUT_CSV,  help="Output CSV (Default: fibbreakout-fiborigin.csv)")
-    p.add_argument("--xlsx", default=DEFAULT_OUT_XLSX, help="Output XLSX (Default: fibbreakout-fiborigin.xlsx)")
+    p = argparse.ArgumentParser()
+    p.add_argument("--cut", help="Pfad zur CUT-Datei (TSV/CSV). Wenn leer, wird automatisch gesucht.")
+    p.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK)
+    p.add_argument("--out", default=DEFAULT_OUT_CSV)
     args = p.parse_args()
 
     book = PriceBook()
-    cut  = load_cut(args.cut)
+    cut_df = load_cut(args.cut)
 
-    rows=[]
-    for _, r in cut.iterrows():
-        pair = str(r["pair"]); ws, we = r["start"], r["end"]; want = r["direction"]
-        df, fpath, sheet = book.load(pair)
-        windows=[(ws,we)]
-        for mode in ("breakout","origin"):
-            rows += _signals_for_mode(
-                df, mode, want, windows, args.lookback,
-                meta_pair=pair, meta_file=fpath, meta_sheet=sheet
-            )
+    rows = []
+    for _, r in cut_df.iterrows():
+        df_prices = book.load(r["pair"])
+        windows = [(r["start"], r["end"])]
+        for mode in ("breakout", "origin"):
+            rows += _signals_for_mode(df_prices, mode, r["direction"], windows, args.lookback)
 
-    # nur die Spalten, die du in deinem Output willst
-    out_cols = [
-        "pair","signal_type","direction","window_start","window_end",
-        "start_time","end_time","extreme_time","extreme_price"
-    ]
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out = out[out_cols].sort_values(["pair","signal_type","start_time"]).reset_index(drop=True)
+    out_df = pd.DataFrame(rows)
+    _save_outputs(out_df, args.out)
 
-    _save_outputs(out, args.out, args.xlsx)
+if __name__ == "__main__":
+    main()
 
-    print(f"✅ done. Wrote: {args.out}  &  {args.xlsx}")
-    if not out.empty:
-        print(out.head(min(12, len(out))).to_string(index=False))
 
 if __name__ == "__main__":
     main()
